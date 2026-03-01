@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+# Flatten the given merge commit.
+# If merge cannot be flattened without conflict,
+#  squash the changes of the shorter branch of merge of the onto the longer branch.
+set -euo pipefail
+# Usage: git-rebase-squash-merge <merge-commit>
+# Usage: git-rebase-squash-merge `git log --merges -n 1 --pretty=format:"%H"`
+
+if [ "$#" -ne 1 ]; then
+  echo "Usage: $0 <merge-commit>" >&2
+  exit 2
+fi
+
+M="$1"
+
+if ( git rebase "$M"^ ); then
+  echo "Simple merge rebase successful."
+  exit 0
+else
+  git rebase --abort
+fi
+
+# Validate commit
+if ! git rev-parse --verify --quiet "$M" >/dev/null; then
+  echo "Error: commit $M not found" >&2
+  exit 3
+fi
+
+# Ensure it's a merge commit with two parents
+parents=($(git rev-list --parents -n1 "$M"))
+# first item is M, rest are parents
+if [ "${#parents[@]}" -lt 3 ]; then
+  echo "Error: commit $M is not a merge commit with two parents" >&2
+  exit 4
+fi
+
+# parents array: [M parent1 parent2]
+P1="${parents[1]}"
+P2="${parents[2]}"
+
+echo "Merge commit: $M"
+echo "Parents: $P1 (M^1), $P2 (M^2)"
+
+# Compute merge base
+B=$(git merge-base "$P1" "$P2")
+if [ -z "$B" ]; then
+  echo "Error: could not compute merge-base of $P1 and $P2" >&2
+  exit 5
+fi
+echo "Merge-base: $B"
+
+# Count commits from B (exclusive) to each parent (inclusive)
+count_range() {
+  local from=$1 to=$2
+  git rev-list --count "${from}..${to}"
+}
+
+cnt1=$(count_range "$B" "$P1")
+cnt2=$(count_range "$B" "$P2")
+
+echo "Commits since base: P1=$cnt1, P2=$cnt2"
+
+# Decide short and long sides: short = fewer commits (tie -> P2 as short arbitrarily)
+if [ "$cnt1" -le "$cnt2" ]; then
+  S="$P1"
+  L="$P2"
+  SIDE="P1_short"
+else
+  S="$P2"
+  L="$P1"
+  SIDE="P2_short"
+fi
+
+echo "Short side: $S"
+echo "Long side:  $L"
+
+# Save current HEAD
+H=$(git rev-parse --verify HEAD)
+echo "Saved HEAD: $H"
+
+git checkout "$L"
+
+
+count="$(git rev-list --no-merges --count $B..$S)"
+if [ "$count" != "1" ]; then
+date="$(git log -n1 --no-merges --pretty=format:"%ad" $M)"
+author="$(git log -n1 --no-merges --pretty=format:"%an <%ae>" $M)"
+message="$(git log --reverse --no-merges --pretty=format:"* %B" $B..$S | grep -v '^#' || echo . )"
+else
+date="$(git log -n1 --no-merges --pretty=format:"%ad" $S)"
+author="$(git log -n1 --no-merges --pretty=format:"%an <%ae>" $S)"
+message="$(git log -n1 --no-merges --pretty=format:"%B" $S | grep -v '^#' || echo . )"
+fi
+
+git restore --source="$M" -- .
+git diff --pretty="" --name-only HEAD "$M" | while read file ; do git add -f "$file"; done
+git commit --allow-empty --date="$date" --author="$author" --message="$message" 
+echo "Created commit with merged changes"
+
+# At this point, the apply_branch HEAD should match the merge result M (or at least contain the SQ changes as in M).
+git diff "$M"
+
+git cherry-pick --empty=drop "${M}..${H}"
+
+git diff "$H"
+
+final_head=$(git rev-parse --verify HEAD)
+echo "Resulting branch: $final_head"
