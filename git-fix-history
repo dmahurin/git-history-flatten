@@ -1,0 +1,104 @@
+#!/usr/bin/env python3
+# Align Committer with Author while ensuring monotonic dates.
+import subprocess
+import sys
+import re
+
+def main():
+    print("Starting history fix...")
+    print("Goal: Align Committer with Author while ensuring monotonic dates.")
+
+    # Open fast-export process
+    export_proc = subprocess.Popen(
+        ["git", "fast-export", "HEAD"],
+        #, "--all", "--use-done-feature"],
+        stdout=subprocess.PIPE,
+        bufsize=1024*1024
+    )
+
+    # Backup current state
+    try:
+        subprocess.run(["git", "branch", "backup-before-fix"], check=True, capture_output=True)
+    except subprocess.CalledProcessError:
+        pass
+
+    # Open fast-import process
+    import_proc = subprocess.Popen(
+        ["git", "fast-import", "--force", "--quiet"],
+        stdin=subprocess.PIPE,
+        bufsize=1024*1024
+    )
+
+    # Regex to capture Author info: author Name <email> 123456789 +0000
+    author_re = re.compile(rb'^author (.*? <.*?> )(\d+)( [+-]\d+)$')
+    # Regex to identify Committer line
+    committer_re = re.compile(rb'^committer .*')
+
+    # State tracking
+    current_identity = b""  # "Name <email> "
+    current_timestamp = 0
+    current_timezone = b""
+    
+    last_timestamp = 0
+    last_timezone = b""
+    last_name = b""
+    
+    print("Processing stream...")
+    
+    try:
+        for line in export_proc.stdout:
+            author_match = author_re.match(line)
+            
+            if author_match := author_re.match(line):
+                # Capture current commit's author details
+                identity, timestamp_bytes, timezone = author_match.groups()
+                last_identity = current_identity
+                last_timestamp = current_timestamp
+                last_timezone = current_timezone
+                current_identity = identity
+                current_timestamp = int(timestamp_bytes)
+                current_timezone = timezone
+
+                # timestamp must be >= last
+                if current_timestamp < last_timestamp:
+                    #current_identity = last_identity
+                    #current_timezone = last_timezone
+                    current_timestamp = last_timestamp
+                
+                # Pass author line through UNCHANGED
+                import_proc.stdin.write(line)
+                
+            elif committer_re.match(line):
+                # Construct new committer line using AUTHOR'S identity and the corrected date
+                new_committer_line = (
+                    b"committer " + 
+                    current_identity + 
+                    str(current_timestamp).encode() + 
+                    current_timezone + 
+                    b"\n"
+                )
+                import_proc.stdin.write(new_committer_line)
+            else:
+                # Pass all other data (blobs, messages, marks) through unchanged
+                import_proc.stdin.write(line)
+                
+    except Exception as e:
+        print(f"Error during processing: {e}")
+        export_proc.terminate()
+        import_proc.terminate()
+        sys.exit(1)
+
+    import_proc.stdin.close()
+    export_proc.stdout.close()
+    export_proc.wait()
+    import_proc.wait()
+
+    if import_proc.returncode == 0:
+        print("\nSuccess: History fixed.")
+        print("- Committer metadata: Aligned with Author (monotonic).")
+    else:
+        print(f"\nError: fast-import failed with return code {import_proc.returncode}")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
