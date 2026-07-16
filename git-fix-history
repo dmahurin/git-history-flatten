@@ -4,13 +4,54 @@ import subprocess
 import sys
 import re
 
+def usage():
+    print(f"Usage: {sys.argv[0]} [<start-commit-or-ref>]", file=sys.stderr)
+
+def resolve_start_ref(start_ref):
+    try:
+        commit = subprocess.run(
+            ["git", "rev-parse", "--verify", f"{start_ref}^{{commit}}"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    except subprocess.CalledProcessError:
+        print(f"Error: {start_ref!r} is not a commit or ref.", file=sys.stderr)
+        sys.exit(2)
+
+    if subprocess.run(
+        ["git", "merge-base", "--is-ancestor", commit, "HEAD"],
+        capture_output=True,
+    ).returncode != 0:
+        print(f"Error: {start_ref!r} is not an ancestor of HEAD.", file=sys.stderr)
+        sys.exit(2)
+
+    return commit
+
+def commit_timestamp(commit):
+    return int(subprocess.run(
+        ["git", "show", "-s", "--format=%ct", commit],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip())
+
 def main():
+    if len(sys.argv) > 2 or (len(sys.argv) == 2 and sys.argv[1] in ("-h", "--help")):
+        usage()
+        sys.exit(0 if len(sys.argv) == 2 else 2)
+
+    start_commit = resolve_start_ref(sys.argv[1]) if len(sys.argv) == 2 else None
+    export_revision = f"{start_commit}..HEAD" if start_commit else "HEAD"
+
     print("Starting history fix...")
     print("Goal: Align Committer with Author while ensuring monotonic dates.")
+    if start_commit:
+        print(f"Rewriting commits after {sys.argv[1]} ({start_commit[:12]}).")
 
     # Open fast-export process
     export_proc = subprocess.Popen(
-        ["git", "fast-export", "HEAD"],
+        ["git", "fast-export", "--reference-excluded-parents", export_revision],
         #, "--all", "--use-done-feature"],
         stdout=subprocess.PIPE,
         bufsize=1024*1024
@@ -39,7 +80,7 @@ def main():
     current_timestamp = 0
     current_timezone = b""
     
-    last_timestamp = 0
+    last_timestamp = commit_timestamp(start_commit) if start_commit else 0
     last_timezone = b""
     last_name = b""
     
